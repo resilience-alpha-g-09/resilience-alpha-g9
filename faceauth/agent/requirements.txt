@@ -1,0 +1,5 @@
+# PC Hôte (Windows), hors Docker :  py -3.12 -m venv .venv && .\.venv\Scripts\pip install -r requirements.txt
+opencv-contrib-python==4.11.0.86
+numpy<2.3
+fastapi==0.115.12
+uvicorn[standard]==0.34.2

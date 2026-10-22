@@ -1,0 +1,34 @@
+{% extends "base.html" %}{% block title %}Première mise en service{% endblock %}
+{% block content %}
+<section class="login">
+  <h1>Première mise en service</h1>
+  <p class="muted">Aucun visage n'est encore enrôlé : l'administrateur s'identifie par mot de passe <b>une seule fois</b> pour enregistrer son visage. Cette page disparaît ensuite.</p>
+  <div id="msg" class="msg" hidden></div>
+  <form id="f1" class="card" style="display:grid;gap:10px">
+    <label>Identifiant administrateur <input id="login" required pattern="[a-zA-Z0-9_.@-]{2,64}" value="admin"></label>
+    <label>Mot de passe <input id="password" type="password" required></label>
+    <button>Continuer → caméra</button>
+  </form>
+  <div id="f2" class="card" hidden style="display:grid;gap:10px">
+    <div class="camwrap"><video id="cam" autoplay playsinline muted></video><div id="camstatus" class="camstatus">Activation de la caméra…</div></div>
+    <p class="muted">Face à l'objectif, seul dans le champ, éclairé de face. 40 images en 10 s.</p>
+    <div style="display:flex;gap:8px"><button id="start">Démarrer la capture</button><a class="btn sec" href="{{ root }}/login" style="text-decoration:none;display:inline-block">Annuler</a></div>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}<script>
+const R="{{ root }}", msg=document.getElementById('msg'), video=document.getElementById('cam');
+document.getElementById('f1').addEventListener('submit',async e=>{e.preventDefault();
+  const j=await api('POST',R+'/api/bootstrap/password',{login:document.getElementById('login').value.trim(),password:document.getElementById('password').value});
+  if(!j.ok){flash(msg,j.detail||'refusé','crit');return;}
+  document.getElementById('f1').hidden=true;document.getElementById('f2').hidden=false;
+  try{await Cam.start(video);document.getElementById('camstatus').textContent='Caméra active';}catch(err){flash(msg,camError(err),'warn');}
+});
+document.getElementById('start').addEventListener('click',async()=>{if(!Cam.stream)return;const b=document.getElementById('start');b.disabled=true;
+  const images=await captureBatch(video,40,250,(i,n)=>{document.getElementById('camstatus').textContent=`Capture ${i}/${n}`;});
+  document.getElementById('camstatus').textContent='Entraînement…';Cam.stop(video);
+  const j=await api('POST',R+'/api/bootstrap/enroll-images',{images});
+  if(j.ok){flash(msg,`Visage enrôlé (${j.frames} images). Redirection vers la connexion…`,'ok');setTimeout(()=>location.href=j.redirect,1200);}
+  else{b.disabled=false;flash(msg,j.detail||'échec','crit');try{await Cam.start(video);}catch(e){}}
+});
+</script>{% endblock %}

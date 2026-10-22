@@ -1,0 +1,9 @@
+# Chiffrement des secrets avec SOPS + age.
+# 1. age-keygen -o ~/.config/sops/age/keys.txt   (clé privée, JAMAIS dans le repo)
+# 2. remplacer la recipient ci-dessous par la clé publique (age1...)
+# 3. sops -e .env > .env.enc   /   sops -d .env.enc > .env
+creation_rules:
+  - path_regex: \.env\.enc$
+    age: age1replace-me-with-the-team-public-key
+  - path_regex: ansible/.*\.enc\.ya?ml$
+    age: age1replace-me-with-the-team-public-key

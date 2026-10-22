@@ -1,0 +1,95 @@
+# Surcharge du vhost de l'image owasp/modsecurity-crs:nginx.
+# ${PORT} est substitué par l'entrypoint ; les $variables nginx sont laissées intactes.
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+server {
+    listen ${PORT} default_server;
+    server_name _;
+    resolver 127.0.0.11 valid=5s ipv6=off;   # DNS Docker : upstreams résolus à chaud (survit aux restarts)
+
+    # ModSecurity + CRS sont activés au niveau http par l'image (conf.d/modsecurity.conf) : rien à redéclarer ici.
+    server_tokens off;
+
+    access_log /dev/stdout json_combined;
+
+    # La liste de blocage du remédiateur (deny <ip>;) s'applique aux routes métier (/api/, /auth/, client) — jamais à la
+    # supervision, à Grafana ni au back-office : la console de l'hôte doit rester visible pendant un incident, même si
+    # son adresse est confondue avec celle de la source (NAT de Docker Desktop : toutes les connexions publiées arrivent en 192.168.65.1).
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection "";
+    proxy_connect_timeout 2s;
+    proxy_read_timeout 10s;
+    client_max_body_size 64k;
+
+    location = /healthz { access_log off; default_type text/plain; return 200 "ok\n"; }
+
+    location /api/ {
+        include /etc/nginx/blocklist/blocklist.conf;
+        limit_req zone=ra_throttle burst=10 nodelay;   # ne s'applique qu'aux adresses de throttle.conf
+        limit_req_status 429;
+        set $api_upstream http://api:8000;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass $api_upstream;
+    }
+    location /auth/ {
+        include /etc/nginx/blocklist/blocklist.conf;
+        limit_req zone=ra_throttle burst=10 nodelay;   # ne s'applique qu'aux adresses de throttle.conf
+        limit_req_status 429;
+        set $auth_upstream http://auth:8000;
+        rewrite ^/auth/(.*)$ /$1 break;
+        proxy_pass $auth_upstream;
+    }
+    # Back-office (authentification renforcée : identifiant → caméra → mot de passe)
+    location = /admin/api/login/frame {          # images de la webcam toutes les 300 ms : pas de limitation de débit, corps ≤ 2 Mo
+        client_max_body_size 2m;
+        set $bo_upstream http://backoffice:8000;
+        proxy_read_timeout 20s;
+        proxy_pass $bo_upstream;
+    }
+    location /admin/api/login/ {
+        limit_req zone=bo_login burst=5 nodelay;
+        limit_req_status 429;
+        set $bo_upstream http://backoffice:8000;
+        proxy_read_timeout 45s;          # l'étape caméra peut durer jusqu'à 10 s
+        proxy_pass $bo_upstream;
+    }
+    location /admin/ {
+        client_max_body_size 8m;         # enrôlement depuis le navigateur : lot de ~40 images JPEG
+        set $bo_upstream http://backoffice:8000;
+        proxy_read_timeout 70s;          # enrôlement côté agent : 30 captures
+        proxy_pass $bo_upstream;
+    }
+    # Origine unique : supervision et Grafana derrière l'edge (la page de supervision embarque des panneaux Grafana)
+    location /supervision/ {
+        set $dash_upstream http://dashboard:8080;
+        proxy_pass $dash_upstream;
+    }
+    location = /supervision/assistant/ask {   # réponse du LLM (PC IA) : 20-40 s, au-delà des 10 s par défaut
+        set $dash_upstream http://dashboard:8080;
+        proxy_pass $dash_upstream;
+        proxy_read_timeout 90s;
+    }
+    location /grafana/ {
+        set $graf_upstream http://grafana:3000;
+        # un proxy_set_header dans un location annule l'héritage de ceux du serveur : on les répète (Host surtout,
+        # sinon Grafana Live voit host=grafana:3000 et refuse l'Origin du navigateur)
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;        # WebSocket Grafana Live
+        proxy_pass $graf_upstream;
+    }
+    location / {
+        include /etc/nginx/blocklist/blocklist.conf;
+        set $front_upstream http://front:8080;
+        proxy_pass $front_upstream;
+    }
+}

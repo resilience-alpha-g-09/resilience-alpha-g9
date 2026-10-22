@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block title %}Accueil{% endblock %}
+{% block content %}
+<h1>Supervision des accès</h1>
+<div class="grid">
+  <div class="card"><div class="k">Agent caméra (PC Hôte)</div><div class="v">{% if agent %}<span class="pill ok">en ligne</span>{% if agent.mock %} <span class="pill warn">simulé</span>{% endif %}{% else %}<span class="pill crit">injoignable</span>{% endif %}</div><p class="muted">{% if agent %}{{ agent.enrolled|length }} visage(s) enrôlé(s) · seuil {{ agent.threshold }}{% else %}lancer <code>python agent.py serve</code> sur le PC Hôte{% endif %}</p></div>
+  <div class="card"><div class="k">Opérateurs</div><div class="v">{{ counts.total }}</div><p class="muted">{{ counts.active }} actifs · {{ counts.enrolled }} avec visage enrôlé</p></div>
+  <div class="card"><div class="k">Identifiants bloqués</div><div class="v">{{ locked|length }}</div><p class="muted">{% for l in locked %}{{ l.login }} → {{ l.locked_until.strftime('%H:%M:%S') }}{% if not loop.last %} · {% endif %}{% else %}aucun{% endfor %}</p></div>
+  <div class="card block"><div class="k">LED bicolore</div><div class="v"><span id="ledv" class="led {{ led.state }}"><i></i> {{ led.state }}</span></div><p class="muted" id="ledr">{{ led.reason }}{% if led.remaining_ms %} · {{ (led.remaining_ms/1000)|round|int }} s{% endif %}</p></div>
+</div>
+{% if user.role == 'admin' %}
+<section class="card"><h2>Test de la LED (démo, admin)</h2><div style="display:flex;gap:8px;flex-wrap:wrap">{% for s in states %}<button class="sec" onclick="ledTest('{{ s }}')">{{ s }}</button>{% endfor %}</div><div id="ledmsg" class="msg" hidden style="margin-top:10px"></div></section>
+{% endif %}
+<section><h2>Dernières tentatives</h2>
+<table><thead><tr><th>Quand</th><th>Identifiant</th><th>Étape</th><th>Résultat</th><th>Détail</th><th>IP</th></tr></thead><tbody>
+{% for a in attempts %}<tr><td>{{ a.created_at.strftime('%d/%m %H:%M:%S') }}</td><td>{{ a.login }}</td><td>{{ a.step }}</td><td><span class="pill {{ 'ok' if a.result in ('recognized','success') else 'crit' }}">{{ a.result }}</span></td><td class="muted">{{ a.detail or '' }}</td><td class="muted">{{ a.ip }}</td></tr>{% else %}<tr><td colspan="6" class="muted">aucune tentative</td></tr>{% endfor %}
+</tbody></table></section>
+{% endblock %}
+{% block scripts %}<script>
+const R="{{ root }}";
+async function ledTest(s){const j=await api('POST',R+'/api/led/test',{state:s});flash(document.getElementById('ledmsg'),j.state?('LED → '+j.state):(j.detail||'erreur'),j.state?'ok':'crit');}
+setInterval(async()=>{const r=await fetch(R+'/api/led-state');const j=await r.json();const el=document.getElementById('ledv');el.className='led '+j.state;el.innerHTML='<i></i> '+j.state;document.getElementById('ledr').textContent=j.reason+(j.remaining_ms?` · ${Math.round(j.remaining_ms/1000)} s`:'');},1000);
+</script>{% endblock %}

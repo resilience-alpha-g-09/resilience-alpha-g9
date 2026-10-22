@@ -1,0 +1,17 @@
+---
+# PRA : reconstruction complète depuis zéro (données comprises). C'est la procédure de dernier recours du PCA/PRA.
+- name: Restaurer RESILIENCE-ALPHA depuis zéro
+  hosts: host
+  gather_facts: false
+  vars:
+    repo_dir: "{{ playbook_dir | dirname }}"
+    wipe_data: true
+  tasks:
+    - name: Arrêter la stack{{ ' et supprimer les volumes' if wipe_data else '' }}
+      ansible.builtin.command: "docker compose down --remove-orphans {{ '-v' if wipe_data else '' }}"
+      args: { chdir: "{{ repo_dir }}" }
+      changed_when: true
+
+
+- name: Redéployer
+  ansible.builtin.import_playbook: deploy.yml

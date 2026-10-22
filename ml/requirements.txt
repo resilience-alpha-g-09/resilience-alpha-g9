@@ -1,0 +1,5 @@
+# Uniquement si vous lancez collect/train hors conteneur. `make collect` / `make train` utilisent l'image du détecteur.
+httpx==0.28.1
+scikit-learn==1.6.1
+numpy==2.2.6
+joblib==1.5.1

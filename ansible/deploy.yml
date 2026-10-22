@@ -1,0 +1,51 @@
+---
+# Déploiement reproductible du PC Hôte : secrets déchiffrés (SOPS), stack construite et démarrée, santé vérifiée.
+- name: Déployer RESILIENCE-ALPHA
+  hosts: host
+  gather_facts: false
+  vars:
+    repo_dir: "{{ playbook_dir | dirname }}"
+  tasks:
+    - name: Vérifier que docker et sops sont installés
+      ansible.builtin.command: "{{ item }} --version"
+      loop: [docker, sops]
+      changed_when: false
+
+    - name: Déchiffrer .env.enc → .env (si présent)
+      ansible.builtin.shell: sops -d .env.enc > .env
+      args: { chdir: "{{ repo_dir }}", creates: "{{ repo_dir }}/.env" }
+      when: (repo_dir + '/.env.enc') is file
+
+    - name: Refuser de déployer sans .env
+      ansible.builtin.stat: { path: "{{ repo_dir }}/.env" }
+      register: envfile
+      failed_when: not envfile.stat.exists
+
+    - name: Blocklist edge vide au déploiement
+      ansible.builtin.copy:
+        dest: "{{ repo_dir }}/infra/edge/blocklist/blocklist.conf"
+        content: "# Géré par le remédiateur — une ligne \"deny <ip>;\" par source bloquée. Vidé par `make reset`.\n"
+        mode: "0664"
+
+    - name: Construire et démarrer la stack
+      ansible.builtin.command: docker compose up -d --build --remove-orphans
+      args: { chdir: "{{ repo_dir }}" }
+      changed_when: true
+
+    - name: Attendre que l'edge réponde
+      ansible.builtin.uri: { url: "http://127.0.0.1/healthz", status_code: 200 }
+      register: edge
+      until: edge.status == 200
+      retries: 30
+      delay: 5
+
+    - name: Attendre que le remédiateur réponde
+      ansible.builtin.uri: { url: "http://127.0.0.1:3000/bff/health", status_code: 200 }
+      register: rem
+      until: rem.status == 200
+      retries: 30
+      delay: 5
+
+    - name: Résumé
+      ansible.builtin.debug:
+        msg: "Plateforme en ligne — front http://{{ lookup('env','HOST_IP') | default('127.0.0.1', true) }}/ · dashboard :3000 · grafana 127.0.0.1:3001"

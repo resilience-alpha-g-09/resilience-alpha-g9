@@ -1,0 +1,380 @@
+# RESILIENCE-ALPHA — plateforme de paiement fictive + boucle de reprise autonome
+# Réseaux : edge (exposé sur le hotspot), app (services métier), data (DB), ops (supervision/remédiation)
+name: resilience-alpha
+
+x-py-health: &py-health
+  test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2).status==200 else 1)"]
+  interval: 5s
+  timeout: 3s
+  retries: 3
+  start_period: 15s
+
+x-hardened: &hardened
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  read_only: true
+  tmpfs: ["/tmp"]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+networks:
+  edge: {}
+  app: { internal: true }
+  data: { internal: true }
+  ops: {}
+
+volumes:
+  pgdata: {}
+  ollama-data: {}
+  prometheus-data: {}
+  grafana-data: {}
+  loki-data: {}
+
+services:
+  # ───────────────────────── Métier ─────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: ra-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-demo1234}
+      VERIFIER_PASSWORD: ${VERIFIER_PASSWORD:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  auth:
+    build: ./services/auth
+    container_name: ra-auth
+    <<: *hardened
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-payments}
+      JWT_SECRET: ${JWT_SECRET:?set in .env}
+      JWT_TTL_SECONDS: "3600"
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [app, data]
+    healthcheck: *py-health
+
+  api:
+    build: ./services/api
+    container_name: ra-api
+    <<: *hardened
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-payments}
+      AUTH_VERIFY_URL: http://auth:8000/verify
+      AUTH_TIMEOUT_SECONDS: "2"
+    depends_on:
+      db: { condition: service_healthy }
+      auth: { condition: service_healthy }
+    networks: [app, data]
+    healthcheck: *py-health
+
+  front:
+    build: ./services/front
+    container_name: ra-front
+    <<: *hardened
+    tmpfs: ["/tmp", "/var/cache/nginx", "/var/run"]
+    networks: [app]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  edge:
+    # WAF + reverse proxy : seule porte d'entrée publiée sur le hotspot
+    image: owasp/modsecurity-crs:4.25-nginx-alpine-lts
+    container_name: ra-edge
+    environment:
+      PORT: "8080"
+      BACKEND: http://front:8080          # inutilisé (default.conf.template surchargé) mais requis par l'image
+      PARANOIA: "1"
+      BLOCKING_PARANOIA: "1"
+      ANOMALY_INBOUND: "5"
+      ANOMALY_OUTBOUND: "4"
+      MODSEC_RULE_ENGINE: "On"
+      MODSEC_AUDIT_ENGINE: RelevantOnly
+      MODSEC_AUDIT_LOG: /dev/stdout
+      MODSEC_AUDIT_LOG_FORMAT: JSON
+      MODSEC_AUDIT_LOG_PARTS: ABHZ
+      MODSEC_REQ_BODY_LIMIT: "16777216"           # images de la webcam (JSON base64) : au-delà des 128 Ko par défaut
+      MODSEC_REQ_BODY_NOFILES_LIMIT: "8388608"
+      ACCESSLOG: /dev/stdout
+      ERRORLOG: /dev/stderr
+      LOGLEVEL: warn
+    volumes:
+      - ./infra/edge/default.conf.template:/etc/nginx/templates/conf.d/default.conf.template:ro
+      - ./infra/edge/logformat.conf:/etc/nginx/conf.d/00-logformat.conf:ro
+      - ./infra/edge/blocklist:/etc/nginx/blocklist:ro
+      - ./infra/edge/crs-before.conf:/etc/modsecurity.d/owasp-crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:ro
+    ports:
+      - "${EDGE_BIND:-0.0.0.0}:80:8080"
+    depends_on:
+      api: { condition: service_healthy }
+      auth: { condition: service_healthy }
+      front: { condition: service_healthy }
+      backoffice: { condition: service_healthy }
+    networks: [edge, app, ops]   # ops : Grafana et dashboard embarqués dans le cockpit
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  simulator:
+    # Trafic métier normal : baseline ML + état « avant » visible
+    build: ./services/simulator
+    container_name: ra-simulator
+    <<: *hardened
+    environment:
+      TARGET_URL: http://edge:8080
+      RATE_PER_SECOND: ${SIM_RATE:-3}
+      SIM_PASSWORD: ${DEMO_PASSWORD:-demo1234}
+      SIM_USERS: sim1@demo.local,sim2@demo.local,sim3@demo.local,sim4@demo.local,sim5@demo.local
+    depends_on:
+      edge: { condition: service_healthy }
+    networks: [app]
+
+  backoffice:
+    # Back-office : identifiant → caméra (agent du PC Hôte) → mot de passe ; habilitations ; état de la LED (consigne add. 1)
+    build: ./services/backoffice
+    container_name: ra-backoffice
+    <<: *hardened
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-payments}
+      BACKOFFICE_SECRET: ${BACKOFFICE_SECRET:?set in .env}
+      BACKOFFICE_ADMIN_LOGIN: ${BACKOFFICE_ADMIN_LOGIN:-admin}
+      BACKOFFICE_ADMIN_PASSWORD: ${BACKOFFICE_ADMIN_PASSWORD:?set in .env}
+      AGENT_URL: ${AGENT_URL:-http://host.docker.internal:8090}
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
+      BO_MAX_FAILURES: "2"
+      BO_LOCKOUT_SECONDS: "300"
+      CAMERA_MODE: ${CAMERA_MODE:-browser}   # browser : webcam du navigateur (ouvrir le back-office sur localhost du PC Hôte) · server : webcam ouverte par l'agent
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [app, data, ops]   # ops (non interne) : route vers l'agent caméra du PC Hôte ; app/data sont sans sortie
+    healthcheck: *py-health
+
+  mockagent:
+    # Agent caméra SIMULÉ (tests, CI, démo sans caméra) : AGENT_URL=http://mockagent:8090 dans .env
+    build:
+      context: ./faceauth/agent
+      dockerfile: Dockerfile.mock
+    container_name: ra-mockagent
+    profiles: ["mockagent"]
+    environment:
+      AGENT_MOCK: "1"
+      AGENT_MOCK_RESULT: ${AGENT_MOCK_RESULT:-recognized}
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
+    networks: [app]
+    restart: unless-stopped
+
+  # ───────────────────────── Reprise ─────────────────────────
+  socket-proxy:
+    # Seul accès au démon Docker : restart/kill de conteneurs, rien d'autre
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: ra-socket-proxy
+    environment:
+      CONTAINERS: "1"
+      POST: "1"
+      ALLOW_RESTARTS: "1"
+      # tout le reste reste à 0 : pas d'exec, pas d'images, pas de volumes, pas de réseaux
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [ops]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  remediator:
+    build: ./services/remediator
+    container_name: ra-remediator
+    <<: *hardened
+    environment:
+      DOCKER_API: http://socket-proxy:2375
+      EDGE_URL: http://edge:8080
+      EDGE_CONTAINER: ra-edge
+      WATCHED_SERVICES: api=http://api:8000/health=ra-api,auth=http://auth:8000/health=ra-auth
+      BLOCKLIST_PATH: /blocklist/blocklist.conf
+      PROMETHEUS_URL: http://prometheus:9090
+      LOKI_URL: http://loki:3100
+      AUTO_SUSPECT_FROM_LOGS: "true"      # filet : sans IP du détecteur, cherche la source externe dominante dans les logs edge
+      VERIFIER_EMAIL: verifier@internal.local
+      VERIFIER_PASSWORD: ${VERIFIER_PASSWORD}
+      VERIFY_TO_ACCOUNT: "10"
+      POLL_INTERVAL_SECONDS: "5"
+      FAIL_THRESHOLD: "3"                 # 15 s : la détection ML (2 fenêtres = 10 s) reste la voie principale
+      COOLDOWN_SECONDS: "60"
+      HOTSPOT_GATEWAY: ${HOST_IP:-192.168.137.1}
+      SHARED_NAT_IPS: ${SHARED_NAT_IPS:-192.168.65.1}   # passerelle NAT de Docker Desktop : étranglée (6 req/min) au lieu d'être bloquée
+    volumes:
+      - ./infra/edge/blocklist:/blocklist
+    depends_on:
+      socket-proxy: { condition: service_started }
+      edge: { condition: service_healthy }
+    networks: [app, ops]
+    healthcheck: *py-health
+
+  detector:
+    # Détection d'anomalies ML (IsolationForest). Sans modèle : logue les features (mode J1)
+    build:
+      context: .
+      dockerfile: services/detector/Dockerfile
+    container_name: ra-detector
+    <<: *hardened
+    environment:
+      PROMETHEUS_URL: http://prometheus:9090
+      LOKI_URL: http://loki:3100
+      REMEDIATOR_URL: http://remediator:8000
+      MODEL_PATH: /model/model.joblib
+      THRESHOLD_PATH: /model/threshold.json
+      INTERVAL_SECONDS: "5"
+      CONSECUTIVE_WINDOWS: "2"
+      DRY_RUN: ${DETECTOR_DRY_RUN:-false}
+    volumes:
+      - ./ml/model:/model:ro
+    depends_on:
+      prometheus: { condition: service_started }
+      remediator: { condition: service_healthy }
+    networks: [ops]
+    healthcheck: *py-health
+
+  dashboard:
+    # Vue jury : état avant / pendant / après. Parle au remédiateur via /bff/ (GET seulement)
+    build: ./services/dashboard
+    container_name: ra-dashboard
+    <<: *hardened
+    tmpfs: ["/tmp", "/var/cache/nginx", "/var/run"]
+    volumes:
+      - ./services/dashboard/nginx.conf:/etc/nginx/conf.d/default.conf:ro   # retouches nginx sans reconstruire l'image
+    ports:
+      - "${DASHBOARD_BIND:-0.0.0.0}:${DASHBOARD_PORT:-3000}:8080"
+    depends_on:
+      remediator: { condition: service_healthy }
+    networks: [edge, ops]
+
+  # ───────────────────────── Observabilité ─────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    container_name: ra-prometheus
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=3d", "--web.enable-lifecycle"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [ops, app]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  cadvisor:
+    # Métriques conteneurs (bonus Grafana). Les features ML n'en dépendent pas (process_* des services).
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    container_name: ra-cadvisor
+    command: ["--docker_only=true", "--housekeeping_interval=5s", "--store_container_labels=false"]
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks: [ops]
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.5.1
+    container_name: ra-loki
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./infra/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    networks: [ops]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  promtail:
+    image: grafana/promtail:3.5.1
+    container_name: ra-promtail
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./infra/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [loki]
+    networks: [ops]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    container_name: ra-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      # Servi derrière l'edge sous /grafana/ et embarqué dans le cockpit ; lecture anonyme (Viewer) pour l'affichage pendant la démo
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_LIVE_ALLOWED_ORIGINS: "http://localhost,http://127.0.0.1,http://${HOST_IP:-192.168.137.1}"   # Grafana Live (WebSocket) depuis les origines du labo
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on: [prometheus, loki]
+    networks: [ops]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  # ───────────────────────── IA (J2, profil optionnel) ─────────────────────────
+  ollama:
+    image: ollama/ollama:0.9.0
+    container_name: ra-ollama
+    profiles: ["ai"]
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    networks: [ops]
+    restart: unless-stopped
+
+  assistant:
+    # `docker compose --profile ai up -d assistant` suffit si Ollama tourne sur un autre PC (pas besoin du service ollama)
+    build: ./services/assistant
+    container_name: ra-assistant
+    profiles: ["ai"]
+    <<: *hardened
+    tmpfs: ["/tmp", "/home/appuser"]
+    environment:
+      # Ollama local (profil ai) ou PC de délestage IA sur le hotspot : OLLAMA_URL=http://192.168.137.x:11434 dans .env
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
+      EMBED_MODEL: ${EMBED_MODEL:-embeddinggemma}
+      DOCS_PATH: /docs
+      ANONYMIZED_TELEMETRY: "False"       # Chroma : pas de télémétrie sortante (et évite une erreur posthog au démarrage)
+    volumes:
+      - ./docs:/docs:ro
+    ports:
+      - "127.0.0.1:8081:8000"
+    networks: [ops, edge]

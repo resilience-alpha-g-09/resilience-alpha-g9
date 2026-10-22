@@ -1,0 +1,62 @@
+{% extends "base.html" %}{% block title %}Habilitations{% endblock %}
+{% block content %}
+<h1>Habilitations</h1>
+<div id="msg" class="msg" hidden></div>
+<section class="card"><h2>Nouvel opérateur</h2>
+<form id="create" class="inline">
+  <label>Identifiant <input name="login" required pattern="[a-zA-Z0-9_.@-]{2,64}"></label>
+  <label>Nom affiché <input name="display_name" required></label>
+  <label>Mot de passe (≥ 8) <input name="password" type="password" required minlength="8"></label>
+  <label>Rôle <select name="role"><option value="operator">operator</option><option value="admin">admin</option></select></label>
+  <button>Créer</button>
+</form>
+<p class="muted" style="margin-top:8px">Après création : <b>Enrôler le visage</b> — la personne se place devant la caméra du PC Hôte, ~40 images en 10 s.</p>
+</section>
+<table><thead><tr><th>Identifiant</th><th>Nom</th><th>Rôle</th><th>Visage</th><th>État</th><th>Verrouillage</th><th>Actions</th></tr></thead><tbody>
+{% for o in operators %}<tr>
+<td><b>{{ o.login }}</b></td><td>{{ o.display_name }}</td>
+<td><select onchange="setRole('{{ o.login }}',this.value)"><option {% if o.role=='operator' %}selected{% endif %}>operator</option><option {% if o.role=='admin' %}selected{% endif %}>admin</option></select></td>
+<td>{% if o.face_enrolled %}<span class="pill ok">enrôlé</span>{% else %}<span class="pill warn">à enrôler</span>{% endif %}</td>
+<td>{% if o.active %}<span class="pill ok">actif</span>{% else %}<span class="pill crit">désactivé</span>{% endif %}</td>
+<td>{% if o.locked_until and o.locked_until > now %}<span class="pill crit">bloqué → {{ o.locked_until.strftime('%H:%M:%S') }}</span>{% elif o.failures %}<span class="pill warn">{{ o.failures }} échec</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+<td style="white-space:nowrap">
+ {% if camera_mode == 'browser' %}<button class="ghost" onclick="enrollCam('{{ o.login }}')">Enrôler le visage</button>{% else %}<button class="ghost" onclick="act('POST','{{ o.login }}/enroll',this,'Enrôlement en cours… regardez la caméra du PC Hôte')">Enrôler le visage</button>{% endif %}
+ {% if o.face_enrolled %}<button class="ghost" onclick="act('POST','{{ o.login }}/unenroll',this)">Supprimer le visage</button>{% endif %}
+ <button class="ghost" onclick="act('POST','{{ o.login }}/toggle',this)">{{ 'Désactiver' if o.active else 'Activer' }}</button>
+ {% if o.locked_until or o.failures %}<button class="ghost" onclick="act('POST','{{ o.login }}/unlock',this)">Débloquer</button>{% endif %}
+</td></tr>{% endfor %}
+</tbody></table>
+
+<div id="modal" class="modal" hidden>
+  <div class="card" style="max-width:560px;width:100%;display:grid;gap:10px">
+    <h2>Enrôlement du visage — <span id="mlogin"></span></h2>
+    <div class="camwrap"><video id="mcam" autoplay playsinline muted></video><div id="mstatus" class="camstatus">Activation de la caméra…</div></div>
+    <p class="muted">La personne se place face à l'objectif, seule dans le champ, éclairée de face. 40 images en 10 s, puis entraînement.</p>
+    <div style="display:flex;gap:8px"><button id="mstart">Démarrer la capture</button><button type="button" class="sec" id="mclose">Fermer</button></div>
+    <div id="mmsg" class="msg" hidden></div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}<script>
+const R="{{ root }}", msg=document.getElementById('msg');
+document.getElementById('create').addEventListener('submit',async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.target));const j=await api('POST',R+'/api/operators',d);if(j.ok){location.reload()}else flash(msg,j.detail||'erreur','crit');});
+async function act(m,p,btn,wait){if(wait){btn.disabled=true;flash(msg,wait,'info');}const j=await api(m,R+'/api/operators/'+p);if(j.ok){location.reload()}else{btn.disabled=false;flash(msg,j.detail||'erreur','crit');}}
+async function setRole(login,role){const j=await api('POST',R+'/api/operators/'+login+'/role',{role});if(!j.ok)flash(msg,j.detail||'erreur','crit');}
+
+// Enrôlement depuis la webcam du navigateur
+const modal=document.getElementById('modal'), mcam=document.getElementById('mcam'), mstatus=document.getElementById('mstatus'), mmsg=document.getElementById('mmsg');
+let mLogin=null;
+async function enrollCam(login){mLogin=login;document.getElementById('mlogin').textContent=login;mmsg.hidden=true;modal.hidden=false;
+  try{await Cam.start(mcam);mstatus.textContent='Caméra active';}catch(e){mstatus.textContent='';flash(mmsg,camError(e),'warn');}}
+function closeModal(){Cam.stop(mcam);modal.hidden=true;}
+document.getElementById('mclose').addEventListener('click',closeModal);
+modal.addEventListener('click',e=>{if(e.target===modal)closeModal();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!modal.hidden)closeModal();});
+document.getElementById('mstart').addEventListener('click',async()=>{if(!Cam.stream)return;const b=document.getElementById('mstart');b.disabled=true;
+  const images=await captureBatch(mcam,40,250,(i,n)=>{mstatus.textContent=`Capture ${i}/${n}`;});
+  mstatus.textContent='Entraînement…';Cam.stop(mcam);
+  const j=await api('POST',R+'/api/operators/'+mLogin+'/enroll-images',{images});
+  if(j.ok){flash(mmsg,`Visage enrôlé : ${j.frames} images exploitables.`,'ok');setTimeout(()=>location.reload(),900);}
+  else{b.disabled=false;flash(mmsg,j.detail||'échec de l\'enrôlement','crit');try{await Cam.start(mcam);}catch(e){}}
+});
+</script>{% endblock %}

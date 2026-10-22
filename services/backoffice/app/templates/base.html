@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Back-office{% endblock %} — RESILIENCE-ALPHA</title>
+<link rel="stylesheet" href="{{ root }}/static/style.css?v={{ asset_v }}"></head>
+<body>
+<header><div class="brand">RESILIENCE-ALPHA <small>back-office · G9</small></div>
+{% if user %}<nav><a href="{{ root }}/">Accueil</a>{% if user.role == 'admin' %}<a href="{{ root }}/operators">Habilitations</a>{% endif %}<a href="{{ root }}/attempts">Journal</a></nav>
+<div class="who">{{ user.name }} · <span class="pill acc">{{ user.role }}</span> · <a href="{{ root }}/logout">Déconnexion</a></div>{% endif %}
+</header>
+<main>{% block content %}{% endblock %}</main>
+<script>
+// Toujours un corps JSON sur POST/DELETE : le WAF (CRS) refuse les requêtes sans Content-Type cohérent
+async function api(method, path, body){const opts={method,headers:{}};if(method!=='GET'){opts.headers['Content-Type']='application/json';opts.body=JSON.stringify(body||{});}const r=await fetch(path,opts);let j={};try{j=await r.json()}catch(e){}return {status:r.status,ok:r.ok,...j};}
+function flash(el,text,kind){el.className='msg '+kind;el.textContent=text;el.hidden=false;}
+// Webcam du navigateur (mode « browser ») : la caméra est celle du PC qui affiche la page — le PC Hôte.
+const Cam={
+  stream:null,
+  async start(video){
+    if(!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)) throw Object.assign(new Error('insecure'),{name:'InsecureContext'});
+    this.stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:false});
+    video.srcObject=this.stream; await video.play(); return this.stream;
+  },
+  snap(video,quality){const c=document.createElement('canvas');c.width=video.videoWidth||640;c.height=video.videoHeight||480;c.getContext('2d').drawImage(video,0,0,c.width,c.height);return {data:c.toDataURL('image/jpeg',quality||0.7).split(',')[1],w:c.width,h:c.height};},   /* base64 nu, sans préfixe data: */
+  stop(video){if(this.stream){this.stream.getTracks().forEach(t=>t.stop());this.stream=null;}if(video)video.srcObject=null;}
+};
+function camError(e){
+  if(e&&e.name==='InsecureContext') return "Le navigateur n'autorise la webcam qu'en HTTPS ou sur localhost : ouvrir http://localhost/admin/ sur le PC Hôte.";
+  if(e&&e.name==='NotAllowedError') return "Accès à la caméra refusé par le navigateur (autoriser la caméra pour ce site).";
+  if(e&&e.name==='NotFoundError') return "Aucune caméra détectée sur ce poste.";
+  return "Caméra indisponible : "+((e&&e.message)||e);
+}
+// Capture n images à intervalle régulier (enrôlement) ; onTick(i,n) pour l'affichage
+async function captureBatch(video,n,intervalMs,onTick){const out=[];for(let i=0;i<n;i++){out.push(Cam.snap(video,0.7).data);if(onTick)onTick(i+1,n);await new Promise(r=>setTimeout(r,intervalMs));}return out;}
+</script>
+{% block scripts %}{% endblock %}
+</body></html>

@@ -1,0 +1,5 @@
+.pio/
+include/config.h
+.idea/
+cmake-build-*/
+CMakeListsPrivate.txt

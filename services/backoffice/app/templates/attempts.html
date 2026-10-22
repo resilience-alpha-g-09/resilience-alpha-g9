@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block title %}Journal{% endblock %}
+{% block content %}
+<h1>Journal des tentatives de connexion</h1>
+<p class="muted">200 dernières entrées. Chaque étape est tracée (identifiant, caméra, mot de passe), avec l'adresse source — également envoyée à Loki.</p>
+<table><thead><tr><th>Quand</th><th>Identifiant</th><th>Étape</th><th>Résultat</th><th>Détail</th><th>IP</th></tr></thead><tbody>
+{% for a in attempts %}<tr><td>{{ a.created_at.strftime('%d/%m %H:%M:%S') }}</td><td>{{ a.login }}</td><td>{{ a.step }}</td><td><span class="pill {{ 'ok' if a.result in ('recognized','success') else ('warn' if a.result in ('locked','camera_unavailable') else 'crit') }}">{{ a.result }}</span></td><td class="muted">{{ a.detail or '' }}</td><td class="muted">{{ a.ip }}</td></tr>{% else %}<tr><td colspan="6" class="muted">aucune tentative</td></tr>{% endfor %}
+</tbody></table>
+{% endblock %}

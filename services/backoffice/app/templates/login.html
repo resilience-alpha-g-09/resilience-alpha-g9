@@ -1,0 +1,78 @@
+{% extends "base.html" %}{% block title %}Connexion{% endblock %}
+{% block content %}
+<section class="login">
+  <h1>Connexion au back-office</h1>
+  <p class="muted">Trois étapes : identifiant, confirmation par la caméra du PC Hôte, puis mot de passe. Deux échecs bloquent l'identifiant 5 minutes.</p>
+  <div class="steps"><span id="s1" class="on">1 · Identifiant</span><span id="s2">2 · Caméra</span><span id="s3">3 · Mot de passe</span></div>
+  <div id="msg" class="msg" hidden></div>
+  <form id="f1" class="card" style="display:grid;gap:10px">
+    <label>Identifiant <input id="login" name="login" autocomplete="username" required pattern="[a-zA-Z0-9_.@-]{2,64}" autofocus></label>
+    <button id="b1">Continuer → caméra</button>
+  </form>
+  <div id="f2" class="card" hidden style="display:grid;gap:10px">
+    {% if camera_mode == 'browser' %}
+    <div class="camwrap"><video id="cam" autoplay playsinline muted></video><div id="box" class="facebox" hidden></div><div id="camstatus" class="camstatus">Activation de la caméra…</div></div>
+    <p class="muted">Identifiant : <b id="who2"></b> · <span id="camhint">regardez l'objectif, visage dégagé</span> · <span id="cd"></span></p>
+    <button type="button" class="sec" id="cancel2">Annuler</button>
+    {% else %}
+    <div class="cam"><span class="dot"></span> Caméra active sur le PC Hôte — regardez l'objectif (≤ {{ face_timeout }} s)</div>
+    <p class="muted">Identifiant : <b id="who2"></b>. La LED reste éteinte pendant la reconnaissance.</p>
+    {% endif %}
+  </div>
+  <form id="f3" class="card" hidden style="display:grid;gap:10px">
+    <p><span class="pill ok">Visage reconnu</span> <b id="who3"></b> — <span class="led green_blink"><i></i> LED verte clignotante</span></p>
+    <label>Mot de passe <input id="password" type="password" autocomplete="current-password" required></label>
+    <div style="display:flex;gap:8px"><button id="b3">Se connecter</button><button type="button" class="sec" id="cancel">Annuler</button></div>
+    <p class="muted">Temps restant pour saisir le mot de passe : <span id="ttl"></span> s</p>
+  </form>
+  {% if needs_bootstrap %}<p class="muted">Première mise en service : <a href="{{ root }}/bootstrap">enrôler le visage de l'administrateur</a>.</p>{% endif %}
+</section>
+{% endblock %}
+{% block scripts %}<script>
+const R="{{ root }}", MODE="{{ camera_mode }}", msg=document.getElementById('msg'), f1=document.getElementById('f1'), f2=document.getElementById('f2'), f3=document.getElementById('f3');
+const steps=[document.getElementById('s1'),document.getElementById('s2'),document.getElementById('s3')];
+let ttlTimer=null, camLoop=false;
+const video=document.getElementById('cam');
+function show(step){[f1,f2,f3].forEach((f,i)=>f.hidden=(i!==step-1));steps.forEach((s,i)=>{s.className=i<step-1?'done':i===step-1?'on':''});}
+function stopCam(){camLoop=false;if(video)Cam.stop(video);const b=document.getElementById('box');if(b)b.hidden=true;}
+function reset(text,kind){clearInterval(ttlTimer);stopCam();document.getElementById('login').value='';document.getElementById('password').value='';show(1);if(text)flash(msg,text,kind||'crit');document.getElementById('login').focus();}
+function lockedText(j){if(!j.locked_until)return '';const d=new Date(j.locked_until);return ` — identifiant bloqué jusqu'à ${d.toLocaleTimeString()}`;}
+function failText(j){const extra=j.remaining_attempts!=null&&!j.locked_until?` (${j.remaining_attempts} essai restant)`:'';return (j.error||'Échec')+extra+lockedText(j);}
+function toPassword(login,ttl){document.getElementById('who3').textContent=login;show(3);flash(msg,'Visage reconnu : saisissez votre mot de passe.','ok');document.getElementById('ttl').textContent=ttl;ttlTimer=setInterval(()=>{ttl--;document.getElementById('ttl').textContent=ttl;if(ttl<=0)reset('Délai dépassé : recommencez l\'identification.','warn')},1000);document.getElementById('password').focus();}
+function setStatus(t,kind){const el=document.getElementById('camstatus');el.textContent=t;el.className='camstatus '+(kind||'');}
+function drawBox(box,w,h,kind){const b=document.getElementById('box');if(!box||!video){b.hidden=true;return;}const sx=video.clientWidth/(w||640),sy=video.clientHeight/(h||480);b.style.left=(box[0]*sx)+'px';b.style.top=(box[1]*sy)+'px';b.style.width=(box[2]*sx)+'px';b.style.height=(box[3]*sy)+'px';b.className='facebox '+kind;b.hidden=false;}
+
+async function browserFlow(login){
+  const j=await api('POST',R+'/api/login/start',{login});
+  if(j.step!=='camera'){reset(failText(j),j.status===503?'warn':'crit');return;}
+  try{await Cam.start(video);}catch(e){await api('POST',R+'/api/login/cancel');reset(camError(e),'warn');return;}
+  setStatus('Caméra active — regardez l\'objectif');
+  camLoop=true; const t0=Date.now(); const cd=document.getElementById('cd');
+  while(camLoop){
+    const snap=Cam.snap(video,0.7);
+    const r=await api('POST',R+'/api/login/frame',{image:snap.data});
+    if(!camLoop)return;
+    if(r.step==='password'){stopCam();toPassword(login,r.ttl_s);return;}
+    if(r.step==='identify'){reset(failText(r),r.status===503?'warn':'crit');return;}
+    cd.textContent=(r.remaining_s!=null?Math.ceil(r.remaining_s):Math.max(0,Math.ceil({{ face_timeout }}-(Date.now()-t0)/1000)))+' s';
+    const v=r.verdict;
+    if(v==='recognized'){setStatus(`Visage reconnu — analyse ${r.streak}/${r.needed}`,'ok');drawBox(r.box,snap.w,snap.h,'ok');}
+    else if(v==='unknown'){setStatus('Visage détecté, non reconnu pour cet identifiant','crit');drawBox(r.box,snap.w,snap.h,'crit');}
+    else if(v==='multiple'){setStatus('Plusieurs visages dans le champ','warn');drawBox(null);}
+    else {setStatus('Placez votre visage face à l\'objectif','');drawBox(null);}
+    await new Promise(res=>setTimeout(res,300));
+  }
+}
+async function serverFlow(login){
+  const j=await api('POST',R+'/api/login/identify',{login});
+  if(j.step==='password') toPassword(login,j.ttl_s); else reset(failText(j),j.status===503?'warn':'crit');
+}
+f1.addEventListener('submit',async e=>{e.preventDefault();const login=document.getElementById('login').value.trim();msg.hidden=true;document.getElementById('who2').textContent=login;show(2);if(MODE==='browser')await browserFlow(login);else await serverFlow(login);});
+f3.addEventListener('submit',async e=>{e.preventDefault();const j=await api('POST',R+'/api/login/password',{password:document.getElementById('password').value});
+  if(j.ok){clearInterval(ttlTimer);flash(msg,'Connexion réussie — LED verte fixe 30 s.','ok');location.href=j.redirect;}
+  else reset(failText(j));
+});
+document.getElementById('cancel').addEventListener('click',async()=>{await api('POST',R+'/api/login/cancel');reset('Identification annulée.','info');});
+const c2=document.getElementById('cancel2'); if(c2) c2.addEventListener('click',async()=>{stopCam();await api('POST',R+'/api/login/cancel');reset('Identification annulée.','info');});
+{% if flow and flow.face_ok %}document.getElementById('who3').textContent="{{ flow.login }}";show(3);{% endif %}
+</script>{% endblock %}
